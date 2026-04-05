@@ -43,6 +43,37 @@ class ParallelEnvWrapper:
     def close(self):
         self.env.close()
 
+    def get_world_state(self) -> dict:
+        """
+        Extract agent / landmark positions from the underlying MPE world.
+        This is used for true Stage-1 metrics in Simple Spread.
+        """
+        base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+
+        if not hasattr(base_env, "world"):
+            raise RuntimeError("Underlying environment has no accessible world state.")
+
+        world = base_env.world
+
+        agent_positions = {}
+        agent_sizes = {}
+        for i, agent in enumerate(world.agents):
+            name = self.possible_agents[i] if i < len(self.possible_agents) else f"agent_{i}"
+            agent_positions[name] = np.asarray(agent.state.p_pos, dtype=np.float32).copy()
+            agent_sizes[name] = float(agent.size)
+
+        landmark_positions = []
+        landmark_sizes = []
+        for landmark in world.landmarks:
+            landmark_positions.append(np.asarray(landmark.state.p_pos, dtype=np.float32).copy())
+            landmark_sizes.append(float(landmark.size))
+
+        return {
+            "agent_positions": agent_positions,
+            "agent_sizes": agent_sizes,
+            "landmark_positions": landmark_positions,
+            "landmark_sizes": landmark_sizes,
+        }
 
 
 def make_env(env_name: str, max_cycles: int = 40, seed: int = 0, **kwargs):
@@ -62,7 +93,6 @@ def make_env(env_name: str, max_cycles: int = 40, seed: int = 0, **kwargs):
     wrapped = ParallelEnvWrapper(env)
     wrapped.reset(seed=seed)
     return wrapped
-
 
 
 def get_env_dims(env: ParallelEnvWrapper):

@@ -5,9 +5,9 @@ from dataclasses import dataclass, asdict
 class Config:
     # experiment
     env_name: str = "simple_spread"
-    algo: str = "mappo"  # choices: ippo, mappo
+    algo: str = "mappo"
     seed: int = 42
-    total_episodes: int = 800
+    total_episodes: int = 200
     max_cycles: int = 40
     eval_every: int = 50
     eval_episodes: int = 10
@@ -28,7 +28,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.001
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     ppo_epochs: int = 4
@@ -36,19 +36,20 @@ class Config:
     rollout_episodes: int = 8
 
     # optimization
-    actor_lr: float = 3e-4
-    critic_lr: float = 3e-4
+    actor_lr: float = 1e-4
+    critic_lr: float = 1e-4
 
     # network
     hidden_dim: int = 128
     shared_actor: bool = True
     shared_critic: bool = True
 
+    # 🆕 reward shaping
+    collision_penalty: float = 0.1  
 
 
 def get_config() -> Config:
     return Config()
-
 
 
 def config_to_dict(cfg: Config) -> dict:

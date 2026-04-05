@@ -3,13 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 
-
 def compute_episode_reward(reward_history: list[dict]) -> float:
     total = 0.0
     for step_rewards in reward_history:
         total += float(sum(step_rewards.values()))
     return total
-
 
 
 def compute_agent_reward_means(reward_history: list[dict]) -> dict:
@@ -22,35 +20,87 @@ def compute_agent_reward_means(reward_history: list[dict]) -> dict:
     return out
 
 
-
-def compute_collision_rate(info_history: list[dict]) -> float:
-    values = []
-    for step_info in info_history:
-        for _, info in step_info.items():
-            if isinstance(info, dict) and "collisions" in info:
-                values.append(float(info["collisions"]))
-    return float(np.mean(values)) if values else 0.0
-
-
-
-def compute_coverage_efficiency(obs_history: list[dict]) -> float:
-    # Placeholder metric for Stage 1.
-    # If you later expose landmark occupancy from env internals, replace this.
-    # For now, return a proxy based on whether all agents remain active.
-    if not obs_history:
+def compute_collision_rate_from_state(
+    state_history: list[dict],
+) -> float:
+    """
+    Average number of pairwise agent-agent collisions per timestep.
+    Two agents collide if distance < size_i + size_j.
+    """
+    if not state_history:
         return 0.0
-    per_step = []
-    for step_obs in obs_history:
-        active = sum(1 for _, obs in step_obs.items() if obs is not None)
-        total = max(len(step_obs), 1)
-        per_step.append(active / total)
-    return float(np.mean(per_step))
+
+    collisions_per_step = []
+
+    for state in state_history:
+        agent_positions = state["agent_positions"]
+        agent_sizes = state["agent_sizes"]
+        agents = list(agent_positions.keys())
+
+        num_collisions = 0
+        for i in range(len(agents)):
+            for j in range(i + 1, len(agents)):
+                ai, aj = agents[i], agents[j]
+                pi = agent_positions[ai]
+                pj = agent_positions[aj]
+                dist = np.linalg.norm(pi - pj)
+                threshold = agent_sizes[ai] + agent_sizes[aj]
+                if dist < threshold:
+                    num_collisions += 1
+
+        collisions_per_step.append(num_collisions)
+
+    return float(np.mean(collisions_per_step))
 
 
+def compute_coverage_efficiency_from_state(
+    state_history: list[dict],
+) -> float:
+    """
+    Coverage Efficiency =
+    (# covered landmarks / total landmarks), averaged over timesteps.
 
-def summarize_episode(reward_history: list[dict], obs_history: list[dict], info_history: list[dict]) -> dict:
+    A landmark is counted as covered if at least one agent is within
+    landmark.size + agent.size of that landmark.
+    """
+    if not state_history:
+        return 0.0
+
+    coverage_values = []
+
+    for state in state_history:
+        agent_positions = state["agent_positions"]
+        agent_sizes = state["agent_sizes"]
+        landmark_positions = state["landmark_positions"]
+        landmark_sizes = state["landmark_sizes"]
+
+        if len(landmark_positions) == 0:
+            coverage_values.append(0.0)
+            continue
+
+        covered = 0
+        for l_idx, l_pos in enumerate(landmark_positions):
+            landmark_covered = False
+            for agent_name, a_pos in agent_positions.items():
+                dist = np.linalg.norm(a_pos - l_pos)
+                threshold = landmark_sizes[l_idx] + agent_sizes[agent_name]
+                if dist < threshold:
+                    landmark_covered = True
+                    break
+            if landmark_covered:
+                covered += 1
+
+        coverage_values.append(covered / len(landmark_positions))
+
+    return float(np.mean(coverage_values))
+
+
+def summarize_episode(
+    reward_history: list[dict],
+    state_history: list[dict],
+) -> dict:
     return {
         "episode_reward": compute_episode_reward(reward_history),
-        "coverage_efficiency": compute_coverage_efficiency(obs_history),
-        "collision_rate": compute_collision_rate(info_history),
+        "coverage_efficiency": compute_coverage_efficiency_from_state(state_history),
+        "collision_rate": compute_collision_rate_from_state(state_history),
     }

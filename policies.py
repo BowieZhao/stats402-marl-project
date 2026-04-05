@@ -87,14 +87,33 @@ class BasePPOPolicy:
 
     @torch.no_grad()
     def select_action(self, obs: np.ndarray, critic_input: np.ndarray):
+        """
+        Training-time action selection: stochastic sampling.
+        """
         obs_t = to_tensor(obs, self.device).unsqueeze(0)
         critic_t = to_tensor(critic_input, self.device).unsqueeze(0)
+
         logits = self.actor(obs_t)
         dist = Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         value = self.critic(critic_t)
+
         return int(action.item()), float(log_prob.item()), float(value.item())
+
+    @torch.no_grad()
+    def act_deterministic(self, obs: np.ndarray, critic_input: np.ndarray):
+        """
+        Eval / visualization action selection: deterministic argmax.
+        """
+        obs_t = to_tensor(obs, self.device).unsqueeze(0)
+        critic_t = to_tensor(critic_input, self.device).unsqueeze(0)
+
+        logits = self.actor(obs_t)
+        action = torch.argmax(logits, dim=-1)
+        value = self.critic(critic_t)
+
+        return int(action.item()), float(value.item())
 
     def evaluate_actions(self, obs_batch: torch.Tensor, critic_batch: torch.Tensor, action_batch: torch.Tensor):
         logits = self.actor(obs_batch)
@@ -111,10 +130,15 @@ class BasePPOPolicy:
             delta = rewards[t] + self.cfg.gamma * next_values[t] * (1.0 - dones[t]) - values[t]
             gae = delta + self.cfg.gamma * self.cfg.gae_lambda * (1.0 - dones[t]) * gae
             advantages.insert(0, gae)
+
         returns = [adv + val for adv, val in zip(advantages, values)]
+
         adv = torch.tensor(advantages, dtype=torch.float32, device=self.device)
         ret = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        if adv.numel() > 1:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
         return adv, ret
 
     def update(self, buffer: PPOBuffer):
@@ -163,7 +187,12 @@ class BasePPOPolicy:
                 ratio = (new_log_probs - mb_old_log_probs).exp()
 
                 surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps) * mb_advantages
+                surr2 = torch.clamp(
+                    ratio,
+                    1.0 - self.cfg.clip_eps,
+                    1.0 + self.cfg.clip_eps,
+                ) * mb_advantages
+
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = F.mse_loss(new_values, mb_returns)
                 loss = actor_loss + self.cfg.value_coef * critic_loss - self.cfg.entropy_coef * entropy
@@ -195,6 +224,11 @@ class BasePPOPolicy:
             path,
         )
 
+    def load(self, path: str, device="cpu"):
+        checkpoint = torch.load(path, map_location=device)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.critic.load_state_dict(checkpoint["critic"])
+
 
 class IPPOPolicy(BasePPOPolicy):
     def get_critic_input(self, obs_dict: dict, agent_id: str, agent_order: list[str]) -> np.ndarray:
@@ -205,7 +239,6 @@ class MAPPOPolicy(BasePPOPolicy):
     def get_critic_input(self, obs_dict: dict, agent_id: str, agent_order: list[str]) -> np.ndarray:
         parts = [np.asarray(obs_dict[a], dtype=np.float32).reshape(-1) for a in agent_order]
         return np.concatenate(parts, axis=0)
-
 
 
 def build_policy(algo: str, obs_dim: int, action_dim: int, global_state_dim: int, cfg):
