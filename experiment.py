@@ -1,10 +1,11 @@
 """
-Robust Universal ExperimentRunner for MARL (PPO / MAPPO / DDPG / DQN / PSO-safe)
-Fixes:
-- NaN-safe logging
-- metric isolation
-- algorithm-agnostic update handling
-- stable evaluation separation
+Unified ExperimentRunner for MARL (MAPPO / DQN / DDPG / PSO).
+
+Key design:
+- MAPPO's metrics have keys like "leader/actor_loss", "adversary/critic_loss", etc.
+- DQN/DDPG/PSO have keys like "q_loss", "actor_loss", "critic_loss", or per-agent keys.
+- The logger tries MAPPO-style keys first, falls back to top-level keys.
+- NaN / Inf values are filtered out of the running mean.
 """
 
 import os
@@ -30,16 +31,14 @@ class ExperimentRunner:
 
         self._global_step = 0
         self._start_time = time.time()
-
-        # ===== safe metric buffer =====
         self._metrics = defaultdict(list)
 
-    # =========================================================
-    # MAIN LOOP
-    # =========================================================
+    # ──────────────────────────────────────────────────────────
+    # Main loop
+    # ──────────────────────────────────────────────────────────
+
     def run(self):
         cfg = self.config
-
         print(f"\n[Experiment Start] {cfg.exp_name}")
         print(f"Episodes={cfg.total_episodes} | Update={cfg.update_every_n_episodes}")
 
@@ -47,65 +46,53 @@ class ExperimentRunner:
 
             ep_stats = self._run_episode(explore=True)
             self._global_step += ep_stats["steps"]
-
             self._accumulate(ep_stats)
 
-            # =========================
-            # UPDATE (ALGO-AGNOSTIC)
-            # =========================
+            # Algorithm update
             if ep % cfg.update_every_n_episodes == 0:
-
                 update_out = self.agent.update(self._global_step)
-
-                # 🔥 SAFE UPDATE HANDLING
                 if isinstance(update_out, dict):
                     self._accumulate(update_out)
 
-            # =========================
-            # EVAL
-            # =========================
+            # Evaluation
             if ep % cfg.eval_every_n_episodes == 0:
                 eval_stats = self._run_eval()
                 self._log_eval(ep, eval_stats)
 
-            # =========================
-            # TRAIN LOG
-            # =========================
+            # Console + CSV log
             if ep % cfg.print_every == 0:
                 self._log_train(ep)
                 self._metrics.clear()
 
-            # =========================
-            # SAVE
-            # =========================
+            # Checkpoint
             if ep % cfg.save_every_n_episodes == 0:
                 path = os.path.join(cfg.model_dir, cfg.exp_name, f"ep{ep:06d}")
                 self.agent.save(path)
                 print(f"[SAVE] {path}")
 
+        # Final save
+        final_path = os.path.join(cfg.model_dir, cfg.exp_name, "final")
+        self.agent.save(final_path)
+        print(f"[SAVE FINAL] {final_path}")
+
         self._csv_file.close()
         print("\n[Training Finished]")
 
-    # =========================================================
-    # EPISODE ROLLOUT
-    # =========================================================
-    def _run_episode(self, explore=True):
+    # ──────────────────────────────────────────────────────────
+    # Episode rollout
+    # ──────────────────────────────────────────────────────────
 
+    def _run_episode(self, explore=True):
         obs, _ = self.env.reset()
         ep_reward = defaultdict(float)
         steps = 0
 
         while self.env.agents:
-
             actions = self.agent.select_actions(obs, self.env, explore=explore)
-
             actions = {a: actions[a] for a in self.env.agents if a in actions}
 
             next_obs, rewards, terms, truncs, infos = self.env.step(actions)
 
-            # =========================
-            # store transition
-            # =========================
             if explore:
                 self.agent.observe({
                     "obs": obs,
@@ -116,9 +103,6 @@ class ExperimentRunner:
                     "truncated": truncs,
                 })
 
-            # =========================
-            # reward aggregation
-            # =========================
             for k, v in rewards.items():
                 ep_reward[k] += float(v)
 
@@ -126,11 +110,9 @@ class ExperimentRunner:
             steps += 1
 
         if explore:
-            self.agent.end_episode()
+            if hasattr(self.agent, "end_episode"):
+                self.agent.end_episode()
 
-        # =========================
-        # SAFE ROLE SPLIT
-        # =========================
         adv = getattr(self.agent, "adv_agents", [])
         good = getattr(self.agent, "good_agents", [])
 
@@ -143,19 +125,17 @@ class ExperimentRunner:
             "good_reward": float(good_r),
         }
 
-    # =========================================================
-    # EVAL
-    # =========================================================
+    # ──────────────────────────────────────────────────────────
+    # Evaluation
+    # ──────────────────────────────────────────────────────────
+
     def _run_eval(self):
         cfg = self.config
-
         adv_r, good_r = [], []
-
         for _ in range(cfg.eval_episodes):
             stats = self._run_episode(explore=False)
             adv_r.append(stats["adv_reward"])
             good_r.append(stats["good_reward"])
-
         return {
             "eval_adv_mean": float(np.mean(adv_r)),
             "eval_adv_std": float(np.std(adv_r)),
@@ -163,86 +143,109 @@ class ExperimentRunner:
             "eval_good_std": float(np.std(good_r)),
         }
 
-    # =========================================================
-    # METRICS HANDLING (NaN SAFE CORE)
-    # =========================================================
+    # ──────────────────────────────────────────────────────────
+    # Metric handling (NaN-safe)
+    # ──────────────────────────────────────────────────────────
+
     def _accumulate(self, d):
         for k, v in d.items():
             if v is None:
                 continue
-            v = float(v)
-
-            # 🔥 NaN / Inf filter (VERY IMPORTANT)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
             if np.isnan(v) or np.isinf(v):
                 continue
-
             self._metrics[k].append(v)
 
     def _mean(self, key):
         vals = self._metrics.get(key, [])
         return float(np.mean(vals)) if len(vals) > 0 else None
 
+    def _mean_any(self, keys):
+        """Try multiple keys, return mean of first one that has data."""
+        for k in keys:
+            v = self._mean(k)
+            if v is not None:
+                return v
+        return None
+
     def _safe(self, v):
-        if v is None or np.isnan(v) or np.isinf(v):
+        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
             return "nan"
         return f"{v:.4f}"
 
-    # =========================================================
-    # TRAIN LOG
-    # =========================================================
-    def _log_train(self, ep):
+    # ──────────────────────────────────────────────────────────
+    # Training log
+    # ──────────────────────────────────────────────────────────
 
+    def _log_train(self, ep):
         elapsed = time.time() - self._start_time
+
+        # MAPPO uses "leader/actor_loss", "adversary/actor_loss", "good/actor_loss".
+        # DDPG uses per-agent "agent_name/actor_loss".
+        # DQN uses per-agent "agent_name/q_loss".
+        # We compute "mean across all such keys" for a unified view.
+
+        def _avg_keys_ending(suffix):
+            vals = []
+            for k in self._metrics:
+                if k.endswith(suffix):
+                    m = self._mean(k)
+                    if m is not None:
+                        vals.append(m)
+            return float(np.mean(vals)) if vals else None
+
+        actor = _avg_keys_ending("/actor_loss") or self._mean("actor_loss")
+        critic = _avg_keys_ending("/critic_loss") or self._mean("critic_loss")
+        entropy = _avg_keys_ending("/entropy") or self._mean("entropy")
+        kl = _avg_keys_ending("/approx_kl") or self._mean("approx_kl")
+        q_loss = _avg_keys_ending("/q_loss") or self._mean("q_loss")
 
         row = {
             "episode": ep,
             "step": self._global_step,
             "time_s": f"{elapsed:.1f}",
-
             "adv_reward": self._safe(self._mean("adv_reward")),
             "good_reward": self._safe(self._mean("good_reward")),
-
-            # losses (multi-algo safe)
-            "actor_loss": self._safe(self._mean("actor_loss")),
-            "critic_loss": self._safe(self._mean("critic_loss")),
-            "q_loss": self._safe(self._mean("q_loss")),
-
-            "entropy": self._safe(self._mean("entropy")),
+            "actor_loss": self._safe(actor),
+            "critic_loss": self._safe(critic),
+            "entropy": self._safe(entropy),
+            "kl": self._safe(kl),
+            "q_loss": self._safe(q_loss),
         }
 
         print(
             f"[EP {ep:5d}] "
             f"adv={row['adv_reward']} good={row['good_reward']} "
             f"actor={row['actor_loss']} critic={row['critic_loss']} "
-            f"q={row['q_loss']} time={row['time_s']}s"
+            f"ent={row['entropy']} time={row['time_s']}s"
         )
 
         self._write(row)
 
-    # =========================================================
-    # EVAL LOG
-    # =========================================================
     def _log_eval(self, ep, stats):
         print(
             f"[EVAL {ep}] "
             f"adv={stats['eval_adv_mean']:.3f}±{stats['eval_adv_std']:.3f} "
             f"good={stats['eval_good_mean']:.3f}±{stats['eval_good_std']:.3f}"
         )
+        row = {"episode": ep, "type": "eval",
+               **{k: f"{v:.4f}" for k, v in stats.items()}}
+        self._write(row)
 
-        self._write({"episode": ep, "type": "eval", **stats})
-
-    # =========================================================
+    # ──────────────────────────────────────────────────────────
     # CSV
-    # =========================================================
-    def _write(self, row):
+    # ──────────────────────────────────────────────────────────
 
+    def _write(self, row):
         if self._csv_writer is None:
             self._csv_writer = csv.DictWriter(
                 self._csv_file,
                 fieldnames=list(row.keys()),
-                extrasaction="ignore"
+                extrasaction="ignore",
             )
             self._csv_writer.writeheader()
-
         self._csv_writer.writerow(row)
         self._csv_file.flush()

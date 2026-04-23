@@ -1,0 +1,7 @@
+episode,step,time_s,adv_reward,good_reward,actor_loss,critic_loss,entropy,kl,q_loss
+20,1000,2.2,24.9691,-94.6376,nan,nan,nan,nan,4.4733
+40,2000,4.4,38.3983,-97.6428,nan,nan,nan,nan,8.0846
+60,3000,6.8,22.7492,-149.5235,nan,nan,nan,nan,10.1868
+80,4000,9.7,20.6964,-241.8609,nan,nan,nan,nan,12.8764
+100,,,,,,,,,
+100,5000,13.2,21.1187,-280.2087,nan,nan,nan,nan,14.3543

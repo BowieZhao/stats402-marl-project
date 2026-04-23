@@ -34,6 +34,10 @@ def parse_args():
     p.add_argument("--ablation", type=str, default=None,
                    choices=["full", "no_comm", "no_leader_pos", "blind"],
                    help="Ablation mode: full/no_comm/no_leader_pos/blind")
+    p.add_argument("--coop_reward", action="store_true",
+                   help="Enable cooperative reward shaping (surround + coverage bonuses)")
+    p.add_argument("--num_good", type=int, default=None,
+                   help="Override num_good (default 2; try 3 for generalization)")
     p.add_argument("--device", type=str, default=None,
                    help="Device: cpu or cuda.")
 
@@ -64,6 +68,8 @@ def print_summary(config, env):
     print(f"  device          = {config.device}")
     print(f"  max_cycles      = {config.max_cycles}")
     print(f"  ablation_mode   = {config.ablation_mode}")
+    print(f"  use_coop_reward = {config.use_coop_reward}")
+    print(f"  num_good        = {config.num_good}")
     print(f"  total_episodes  = {config.total_episodes}")
     print(f"  update_every    = {config.update_every_n_episodes}")
     print()
@@ -94,6 +100,10 @@ def main():
         config.device = args.device
     if args.ablation is not None:
         config.ablation_mode = args.ablation
+    if args.coop_reward:
+        config.use_coop_reward = True
+    if args.num_good is not None:
+        config.num_good = args.num_good
 
     config.make_dirs()
     config.set_seed_everywhere()

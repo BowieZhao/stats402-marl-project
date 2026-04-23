@@ -28,7 +28,9 @@ class Config:
     num_adversaries: int = 4        # includes leader (1 leader + 3 normal)
     num_obstacles: int = 1
     num_food: int = 2
-    num_forests: int = 2
+    num_forests: int = 2           # 2 = only 26% occlusion (too weak)
+                                   # 4 = 69% occlusion (sweet spot)
+                                   # 6+ = occlusion drops again (forests overlap)
     max_cycles: int = 50            # 25 too short; 100 inflates variance
     continuous_actions: bool = False
     dynamic_rescaling: bool = False
@@ -51,18 +53,43 @@ class Config:
     leader_vel_dims: tuple = (24, 26)   # leader velocity in normal adv obs
 
     # ──────────────────────────────────────────────
+    # Cooperative reward shaping
+    # ──────────────────────────────────────────────
+    # The raw MPE adversary reward treats all adversaries symmetrically
+    # (every adv gets +5 for any world-wide ag-adv collision). This makes
+    # cooperation vs independence indistinguishable in reward.
+    #
+    # We add two bonuses on top of the raw reward (only when enabled):
+    #   1. Surround bonus: if 2+ adversaries are within coop_radius of the
+    #      same good agent, each of them gets (n-1) * coop_bonus_per_extra.
+    #      This rewards joint pursuit of the same target.
+    #   2. Coverage bonus: if every good agent has at least one adversary
+    #      within coop_radius, the whole adversary team gets coverage_bonus.
+    #      This prevents the "everyone dogpile on one good" failure mode
+    #      and forces division of labor.
+    #
+    # With both together, the optimal strategy requires coordinated target
+    # assignment -- exactly what leader communication should enable.
+    use_coop_reward: bool = False
+    coop_radius: float = 0.5         # distance threshold for "near" a good
+                                     # 0.3 is too strict (random policy never triggers)
+                                     # 0.5 is ~25% of field; trainable policies trigger
+    coop_bonus_per_extra: float = 2.0  # per extra teammate around a good, per step
+    coverage_bonus: float = 3.0       # when ALL goods have an adv nearby, per step
+
+    # ──────────────────────────────────────────────
     # Training schedule
     # ──────────────────────────────────────────────
     train_team: str = "all"         # "all" = train both adversary + good
 
-    total_episodes: int = 6000
+    total_episodes: int = 4000     # converges around 2500-3000; 4000 gives margin
     # Collect this many episodes before each PPO update.
     # 8 eps × 50 steps × 3 agents/group ≈ 1200 transitions per group.
     update_every_n_episodes: int = 8
 
-    eval_every_n_episodes: int = 200
+    eval_every_n_episodes: int = 100   # more frequent eval for cleaner curves
     eval_episodes: int = 10
-    save_every_n_episodes: int = 1000
+    save_every_n_episodes: int = 500
     print_every: int = 20
 
     # ──────────────────────────────────────────────
@@ -123,7 +150,12 @@ class Config:
     # ──────────────────────────────────────────────
     @property
     def exp_name(self) -> str:
-        return f"{self.run_name}_{self.algo}_{self.ablation_mode}_s{self.seed}"
+        tag = f"{self.algo}_{self.ablation_mode}"
+        if self.use_coop_reward:
+            tag += "_coop"
+        if self.num_good != 2:
+            tag += f"_g{self.num_good}"
+        return f"{self.run_name}_{tag}_s{self.seed}"
 
     # ──────────────────────────────────────────────
     # Utility methods
