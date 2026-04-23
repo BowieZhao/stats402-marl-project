@@ -1,24 +1,31 @@
+"""
+Independent DQN baseline for simple_world_comm.
+
+Each agent has its own Q network and replay buffer.
+No parameter sharing, no cross-agent communication.
+This is the classic IL (Independent Learners) baseline.
+"""
+
 from __future__ import annotations
 
+import os
 import random
 from collections import deque
-from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import os
 
 
-
-# =========================
+# ═══════════════════════════════════════════════════════════
 # Q Network
-# =========================
+# ═══════════════════════════════════════════════════════════
 class QNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden=128):
         super().__init__()
+        self.action_dim = action_dim
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
@@ -31,9 +38,9 @@ class QNetwork(nn.Module):
         return self.net(x)
 
 
-# =========================
+# ═══════════════════════════════════════════════════════════
 # Replay Buffer
-# =========================
+# ═══════════════════════════════════════════════════════════
 class ReplayBuffer:
     def __init__(self, capacity=100000):
         self.buffer = deque(maxlen=capacity)
@@ -44,7 +51,6 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         obs, act, rew, next_obs, done = zip(*batch)
-
         return (
             torch.tensor(np.array(obs), dtype=torch.float32),
             torch.tensor(act, dtype=torch.long),
@@ -57,12 +63,13 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# =========================
-# Single DQN
-# =========================
+# ═══════════════════════════════════════════════════════════
+# Single-agent DQN
+# ═══════════════════════════════════════════════════════════
 class SingleDQN:
     def __init__(self, obs_dim, action_dim, cfg):
         self.device = torch.device(cfg.device)
+        self.action_dim = action_dim
 
         self.q = QNetwork(obs_dim, action_dim).to(self.device)
         self.target_q = QNetwork(obs_dim, action_dim).to(self.device)
@@ -72,24 +79,22 @@ class SingleDQN:
 
         self.gamma = 0.99
         self.batch_size = 64
-        self.tau_steps = 200
+        self.target_update_every = 200
         self.step = 0
 
     def act(self, obs, eps):
         if random.random() < eps:
-            return random.randint(0, self.q.net[-1].out_features - 1)
-
-        obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            return random.randint(0, self.action_dim - 1)
+        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q = self.q(obs)
+            q = self.q(obs_t)
         return int(q.argmax(dim=-1).item())
 
-    def update(self, buffer: ReplayBuffer):
+    def update(self, buffer):
         if len(buffer) < self.batch_size:
             return {"q_loss": 0.0}
 
         obs, act, rew, next_obs, done = buffer.sample(self.batch_size)
-
         obs = obs.to(self.device)
         act = act.to(self.device)
         rew = rew.to(self.device)
@@ -106,21 +111,21 @@ class SingleDQN:
 
         self.optim.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
         self.optim.step()
 
         self.step += 1
-        if self.step % self.tau_steps == 0:
+        if self.step % self.target_update_every == 0:
             self.target_q.load_state_dict(self.q.state_dict())
 
         return {"q_loss": loss.item()}
 
 
-# =========================
-# Multi-Agent DQN (FOR RUNTIME)
-# =========================
-class DQNMultiAgent:
-
-    def __init__(self, env, cfg):
+# ═══════════════════════════════════════════════════════════
+# Multi-agent wrapper (one DQN per agent)
+# ═══════════════════════════════════════════════════════════
+class DQNAgent:
+    def __init__(self, cfg, env):
         self.env = env
         self.cfg = cfg
 
@@ -129,43 +134,27 @@ class DQNMultiAgent:
 
         for name in env.possible_agents:
             spec = env.get_agent_spec(name)
-
-            self.agents[name] = SingleDQN(
-                obs_dim=spec.obs_dim,
-                action_dim=spec.action_dim,
-                cfg=cfg
-            )
-
+            if spec.action_type != "discrete":
+                raise ValueError(f"DQN requires discrete actions, got {spec.action_type} for {name}")
+            self.agents[name] = SingleDQN(spec.obs_dim, spec.action_dim, cfg)
             self.buffers[name] = ReplayBuffer()
 
+        # Role grouping for logging/eval
+        self.adv_agents = [a for a in env.possible_agents
+                           if "adversary" in a]
+        self.good_agents = [a for a in env.possible_agents
+                            if a.startswith("agent_")]
+
+        # Epsilon schedule
         self.epsilon = 1.0
         self.eps_min = 0.05
         self.eps_decay = 0.995
-        # =========================
-# Role grouping (for runner compatibility)
-# =========================
-        self.adv_agents = [
-            name for name in env.possible_agents
-            if "adversary" in name
-        ]
 
-        self.good_agents = [
-            name for name in env.possible_agents
-            if name.startswith("agent_")
-        ]
-
-    # =========================
-    # REQUIRED BY RUNNER
-    # =========================
+    # ── Required interface ──────────────────────────────
     def select_actions(self, obs, env=None, explore=True):
-        actions = {}
-
         eps = self.epsilon if explore else 0.0
-
-        for name, ob in obs.items():
-            actions[name] = self.agents[name].act(ob, eps)
-
-        return actions
+        return {name: self.agents[name].act(ob, eps)
+                for name, ob in obs.items()}
 
     def observe(self, transition):
         obs = transition["obs"]
@@ -173,44 +162,37 @@ class DQNMultiAgent:
         rewards = transition["rewards"]
         next_obs = transition["next_obs"]
 
-        dones = {
-            a: float(transition["terminated"].get(a, False)
-                     or transition["truncated"].get(a, False))
-            for a in obs.keys()
-        }
-
         for a in obs.keys():
+            if a not in self.agents:
+                continue
+            done = float(transition["terminated"].get(a, False)
+                         or transition["truncated"].get(a, False))
             self.buffers[a].add(
-                (obs[a], actions[a], rewards[a], next_obs[a], dones[a])
+                (obs[a], actions[a], rewards[a], next_obs[a], done)
             )
 
     def end_episode(self):
-        pass
+        # Decay epsilon once per episode instead of per update
+        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
 
     def update(self, global_step=None):
         logs = {}
-
         for name, agent in self.agents.items():
             log = agent.update(self.buffers[name])
-            logs[f"{name}_q_loss"] = log["q_loss"]
-
-        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
+            logs[f"{name}/q_loss"] = log["q_loss"]
         logs["epsilon"] = self.epsilon
-
         return logs
 
-    # =========================
-    
-
     def save(self, path):
-        os.makedirs(path, exist_ok=True) 
-
+        os.makedirs(path, exist_ok=True)
         torch.save(
             {k: v.q.state_dict() for k, v in self.agents.items()},
             os.path.join(path, "dqn.pt")
         )
 
     def load(self, path):
-        state = torch.load(path)
+        fp = path if path.endswith(".pt") else os.path.join(path, "dqn.pt")
+        state = torch.load(fp, map_location="cpu", weights_only=False)
         for k in self.agents:
-            self.agents[k].q.load_state_dict(state[k])
+            if k in state:
+                self.agents[k].q.load_state_dict(state[k])
