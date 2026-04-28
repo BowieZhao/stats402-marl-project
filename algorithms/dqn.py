@@ -1,22 +1,27 @@
 """
-Rainbow-lite DQN baseline (Double + Dueling + PER + NoisyNet + N-step).
+Stable DQN baseline (Double + Dueling + N-step + epsilon-greedy + role sharing).
 
-Skipped components vs full Rainbow:
-  - Distributional / C51 (large code change, marginal gains here)
+Removed (vs the Rainbow-lite attempt):
+  - NoisyNet  (caused training instability under multi-agent non-stationarity)
+  - PER       (high-priority transitions go stale fast in non-stationary env)
+  - Distributional / C51
 
-Design (matches MAPPO's RoleGroup structure):
-  - 3 networks: leader, normal_adversary (shared across 3 adv), good
-  - Each role has its own PER buffer + N-step accumulator
-  - Noisy linear layers replace epsilon-greedy exploration
+Kept:
+  - Double DQN (online picks, target evaluates)
+  - Dueling network (V + A streams)
+  - N-step returns (n=3)
+  - Role parameter sharing (3 networks: leader, adversary, good)
+  - Polyak soft target updates
+  - Huber loss + grad clip
+  - Epsilon-greedy with slower decay (more exploration than before)
 """
 
 from __future__ import annotations
 
-import math
 import os
 import random
 from collections import deque
-from typing import Dict, List, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -26,193 +31,32 @@ import torch.optim as optim
 
 
 # ═══════════════════════════════════════════════════════════
-# NoisyLinear (replaces epsilon-greedy)
+# Dueling Q network
 # ═══════════════════════════════════════════════════════════
-class NoisyLinear(nn.Module):
-    """Factorised Gaussian noise on weights — Fortunato et al. 2017."""
-
-    def __init__(self, in_features: int, out_features: int, sigma_init: float = 0.5):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.sigma_init = sigma_init
-
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-        self.register_buffer("weight_eps", torch.empty(out_features, in_features))
-
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        self.register_buffer("bias_eps", torch.empty(out_features))
-
-        self.reset_parameters()
-        self.reset_noise()
-
-    def reset_parameters(self):
-        bound = 1.0 / math.sqrt(self.in_features)
-        self.weight_mu.data.uniform_(-bound, bound)
-        self.bias_mu.data.uniform_(-bound, bound)
-        self.weight_sigma.data.fill_(self.sigma_init / math.sqrt(self.in_features))
-        self.bias_sigma.data.fill_(self.sigma_init / math.sqrt(self.out_features))
-
-    @staticmethod
-    def _scale_noise(size):
-        x = torch.randn(size)
-        return x.sign().mul_(x.abs().sqrt_())
-
-    def reset_noise(self):
-        eps_in = self._scale_noise(self.in_features)
-        eps_out = self._scale_noise(self.out_features)
-        self.weight_eps.copy_(eps_out.outer(eps_in))
-        self.bias_eps.copy_(eps_out)
-
-    def forward(self, x):
-        if self.training:
-            w = self.weight_mu + self.weight_sigma * self.weight_eps
-            b = self.bias_mu + self.bias_sigma * self.bias_eps
-        else:
-            w = self.weight_mu
-            b = self.bias_mu
-        return F.linear(x, w, b)
-
-
-# ═══════════════════════════════════════════════════════════
-# Dueling Q network with NoisyLinear
-# ═══════════════════════════════════════════════════════════
-class DuelingNoisyQ(nn.Module):
+class DuelingQ(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden=128):
         super().__init__()
         self.action_dim = action_dim
-
         self.feature = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
         )
-        # Dueling: value stream + advantage stream
-        self.value_hidden = NoisyLinear(hidden, hidden)
-        self.value_out = NoisyLinear(hidden, 1)
-
-        self.adv_hidden = NoisyLinear(hidden, hidden)
-        self.adv_out = NoisyLinear(hidden, action_dim)
+        self.value = nn.Linear(hidden, 1)
+        self.adv = nn.Linear(hidden, action_dim)
 
     def forward(self, x):
         z = self.feature(x)
-        v = self.value_out(F.relu(self.value_hidden(z)))         # (B, 1)
-        a = self.adv_out(F.relu(self.adv_hidden(z)))             # (B, A)
-        # Q = V + A - mean(A)
-        q = v + a - a.mean(dim=-1, keepdim=True)
-        return q
-
-    def reset_noise(self):
-        for m in [self.value_hidden, self.value_out,
-                  self.adv_hidden, self.adv_out]:
-            m.reset_noise()
+        v = self.value(z)
+        a = self.adv(z)
+        return v + a - a.mean(dim=-1, keepdim=True)
 
 
 # ═══════════════════════════════════════════════════════════
-# Prioritized Experience Replay (PER)
-# ═══════════════════════════════════════════════════════════
-class SumTree:
-    """Binary tree where parent = sum of children. O(log n) sampling."""
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
-        self.data = [None] * capacity
-        self.write = 0
-        self.size = 0
-
-    def _propagate(self, idx, change):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
-
-    def _retrieve(self, idx, s):
-        left = 2 * idx + 1
-        right = left + 1
-        if left >= len(self.tree):
-            return idx
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        return self._retrieve(right, s - self.tree[left])
-
-    def total(self):
-        return self.tree[0]
-
-    def add(self, p, data):
-        idx = self.write + self.capacity - 1
-        self.data[self.write] = data
-        self.update(idx, p)
-        self.write = (self.write + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def update(self, idx, p):
-        change = p - self.tree[idx]
-        self.tree[idx] = p
-        self._propagate(idx, change)
-
-    def get(self, s):
-        idx = self._retrieve(0, s)
-        data_idx = idx - self.capacity + 1
-        return idx, self.tree[idx], self.data[data_idx]
-
-
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
-        self.tree = SumTree(capacity)
-        self.alpha = alpha
-        self.beta_start = beta_start
-        self.beta_frames = beta_frames
-        self.frame = 1
-        self.max_priority = 1.0
-
-    def add(self, transition):
-        # New transitions get max priority so they're sampled at least once
-        self.tree.add(self.max_priority ** self.alpha, transition)
-
-    def __len__(self):
-        return self.tree.size
-
-    def sample(self, batch_size):
-        beta = min(1.0,
-                   self.beta_start + (1.0 - self.beta_start) *
-                   self.frame / self.beta_frames)
-        self.frame += 1
-
-        batch, idxs, priorities = [], [], []
-        seg = self.tree.total() / batch_size
-        for i in range(batch_size):
-            s = random.uniform(seg * i, seg * (i + 1))
-            idx, p, data = self.tree.get(s)
-            if data is None:
-                # Fallback if sumtree returns empty; resample uniformly
-                while data is None:
-                    s = random.uniform(0, self.tree.total())
-                    idx, p, data = self.tree.get(s)
-            batch.append(data)
-            idxs.append(idx)
-            priorities.append(p)
-
-        priorities = np.array(priorities, dtype=np.float64)
-        probs = priorities / self.tree.total()
-        weights = (self.tree.size * probs) ** (-beta)
-        weights /= weights.max()
-
-        return batch, idxs, torch.tensor(weights, dtype=torch.float32)
-
-    def update_priorities(self, idxs, priorities):
-        for idx, p in zip(idxs, priorities):
-            p = float(p)
-            self.max_priority = max(self.max_priority, p)
-            self.tree.update(idx, (p + 1e-6) ** self.alpha)
-
-
-# ═══════════════════════════════════════════════════════════
-# N-step transition accumulator
+# N-step transition accumulator (per source agent)
 # ═══════════════════════════════════════════════════════════
 class NStepBuffer:
-    """Accumulates N consecutive 1-step transitions into a single
-    N-step transition for bootstrapped TD targets."""
     def __init__(self, n=3, gamma=0.99):
         self.n = n
         self.gamma = gamma
@@ -221,7 +65,7 @@ class NStepBuffer:
     def add(self, obs, act, rew, next_obs, done):
         self.buf.append((obs, act, rew, next_obs, done))
         if len(self.buf) < self.n and not done:
-            return None  # not yet full
+            return None
         return self._build()
 
     def _build(self):
@@ -237,7 +81,6 @@ class NStepBuffer:
         return (obs, act, cum_rew, next_obs, done, len(self.buf))
 
     def flush(self):
-        """Drain remaining transitions at episode end."""
         out = []
         while len(self.buf) > 1:
             self.buf.popleft()
@@ -248,34 +91,44 @@ class NStepBuffer:
 
 
 # ═══════════════════════════════════════════════════════════
+# Replay buffer
+# ═══════════════════════════════════════════════════════════
+class ReplayBuffer:
+    def __init__(self, capacity=200000):
+        self.buf = deque(maxlen=capacity)
+
+    def add(self, transition):
+        self.buf.append(transition)
+
+    def sample(self, batch_size):
+        return random.sample(self.buf, batch_size)
+
+    def __len__(self):
+        return len(self.buf)
+
+
+# ═══════════════════════════════════════════════════════════
 # Per-role learner
 # ═══════════════════════════════════════════════════════════
-class RoleRainbowLearner:
+class RoleQLearner:
     def __init__(self, obs_dim, action_dim, cfg, name=""):
         self.device = torch.device(cfg.device)
         self.name = name
         self.action_dim = action_dim
 
-        self.q = DuelingNoisyQ(obs_dim, action_dim).to(self.device)
-        self.target = DuelingNoisyQ(obs_dim, action_dim).to(self.device)
+        self.q = DuelingQ(obs_dim, action_dim).to(self.device)
+        self.target = DuelingQ(obs_dim, action_dim).to(self.device)
         self.target.load_state_dict(self.q.state_dict())
 
-        self.opt = optim.Adam(self.q.parameters(), lr=2.5e-4, eps=1e-5)
+        self.opt = optim.Adam(self.q.parameters(), lr=5e-4)
 
         self.gamma = 0.99
         self.n_step = 3
         self.batch_size = 128
-        self.tau = 0.005   # polyak (NoisyNet handles exploration; soft target)
+        self.tau = 0.005
         self.warmup_steps = 2000
 
-        self.buffer = PrioritizedReplayBuffer(capacity=200000,
-                                              alpha=0.6,
-                                              beta_start=0.4,
-                                              beta_frames=200000)
-
-        # One n-step accumulator per source agent. We use a dict keyed
-        # by agent_name (passed in via add_transition) since multiple agents
-        # share this learner.
+        self.buffer = ReplayBuffer(capacity=200000)
         self.n_step_buffers: Dict[str, NStepBuffer] = {}
 
     def add_transition(self, agent_name, obs, act, rew, next_obs, done):
@@ -291,18 +144,9 @@ class RoleRainbowLearner:
                 self.buffer.add(t)
             del self.n_step_buffers[agent_name]
 
-    def act(self, obs):
-        # NoisyNet IS the exploration mechanism; just sample noise and argmax
-        self.q.train()  # need train mode for noise to apply
-        self.q.reset_noise()
-        obs_t = torch.tensor(obs, dtype=torch.float32,
-                             device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            q = self.q(obs_t)
-        return int(q.argmax(dim=-1).item())
-
-    def act_eval(self, obs):
-        self.q.eval()
+    def act(self, obs, eps):
+        if random.random() < eps:
+            return random.randint(0, self.action_dim - 1)
         obs_t = torch.tensor(obs, dtype=torch.float32,
                              device=self.device).unsqueeze(0)
         with torch.no_grad():
@@ -313,8 +157,7 @@ class RoleRainbowLearner:
         if len(self.buffer) < max(self.warmup_steps, self.batch_size):
             return 0.0
 
-        batch, idxs, weights = self.buffer.sample(self.batch_size)
-        weights = weights.to(self.device)
+        batch = self.buffer.sample(self.batch_size)
 
         obs = torch.tensor(np.array([t[0] for t in batch]),
                            dtype=torch.float32, device=self.device)
@@ -329,33 +172,20 @@ class RoleRainbowLearner:
         n_steps = torch.tensor([t[5] for t in batch],
                                dtype=torch.float32, device=self.device)
 
-        # Reset noise for online & target nets at start of each update
-        self.q.reset_noise()
-        self.target.reset_noise()
-
-        # Online Q value
         q_val = self.q(obs).gather(1, act.unsqueeze(1)).squeeze(1)
 
-        # Double DQN: online picks action, target evaluates
+        # Double DQN: online picks, target evaluates
         with torch.no_grad():
-            self.q.reset_noise()
             next_actions = self.q(next_obs).argmax(dim=1, keepdim=True)
             next_q = self.target(next_obs).gather(1, next_actions).squeeze(1)
-            # N-step bootstrap: gamma^n
             target = rew + (self.gamma ** n_steps) * (1.0 - done) * next_q
 
-        td_errors = q_val - target
-        # Importance-sampling-weighted Huber loss
-        loss = (weights * F.smooth_l1_loss(q_val, target, reduction="none")).mean()
+        loss = F.smooth_l1_loss(q_val, target)
 
         self.opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q.parameters(), 5.0)
         self.opt.step()
-
-        # Update PER priorities
-        new_priorities = td_errors.detach().abs().cpu().numpy() + 1e-6
-        self.buffer.update_priorities(idxs, new_priorities)
 
         # Polyak target update
         for p, tp in zip(self.q.parameters(), self.target.parameters()):
@@ -380,16 +210,22 @@ class DQNAgent:
         self.adv_agents = self.leader_names + self.normal_adv_names
         self.good_agents = self.good_names
 
-        self.learners: Dict[str, RoleRainbowLearner] = {}
+        self.learners: Dict[str, RoleQLearner] = {}
         if self.leader_names:
             spec = env.get_agent_spec(self.leader_names[0])
-            self.learners["leader"] = RoleRainbowLearner(spec.obs_dim, spec.action_dim, cfg, "leader")
+            self.learners["leader"] = RoleQLearner(spec.obs_dim, spec.action_dim, cfg, "leader")
         if self.normal_adv_names:
             spec = env.get_agent_spec(self.normal_adv_names[0])
-            self.learners["adversary"] = RoleRainbowLearner(spec.obs_dim, spec.action_dim, cfg, "adversary")
+            self.learners["adversary"] = RoleQLearner(spec.obs_dim, spec.action_dim, cfg, "adversary")
         if self.good_names:
             spec = env.get_agent_spec(self.good_names[0])
-            self.learners["good"] = RoleRainbowLearner(spec.obs_dim, spec.action_dim, cfg, "good")
+            self.learners["good"] = RoleQLearner(spec.obs_dim, spec.action_dim, cfg, "good")
+
+        # Slower epsilon decay: reaches 0.1 around ep 1500, 0.05 by ep 3000
+        # (was 0.995 -- too slow, good agents kept crashing boundaries)
+        self.epsilon = 1.0
+        self.eps_min = 0.05
+        self.eps_decay = 0.998
 
     def _role(self, agent_name):
         if "leadadversary" in agent_name:
@@ -401,15 +237,13 @@ class DQNAgent:
         return None
 
     def select_actions(self, obs, env=None, explore=True):
+        eps = self.epsilon if explore else 0.0
         actions = {}
         for name, ob in obs.items():
             role = self._role(name)
             if role is None or role not in self.learners:
                 continue
-            if explore:
-                actions[name] = self.learners[role].act(ob)
-            else:
-                actions[name] = self.learners[role].act_eval(ob)
+            actions[name] = self.learners[role].act(ob, eps)
         return actions
 
     def observe(self, transition):
@@ -434,12 +268,14 @@ class DQNAgent:
             )
 
     def end_episode(self):
-        # Flush any remaining n-step transitions at ep boundary
+        # Flush remaining n-step transitions at episode boundary
         for role, learner in self.learners.items():
             for name, nb in list(learner.n_step_buffers.items()):
                 for t in nb.flush():
                     learner.buffer.add(t)
             learner.n_step_buffers.clear()
+        # Decay epsilon
+        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
 
     def update(self, global_step=None):
         logs = {}
@@ -452,6 +288,7 @@ class DQNAgent:
                     losses.append(l)
             if losses:
                 logs[f"{role}/q_loss"] = float(np.mean(losses))
+        logs["epsilon"] = self.epsilon
         return logs
 
     def save(self, path):

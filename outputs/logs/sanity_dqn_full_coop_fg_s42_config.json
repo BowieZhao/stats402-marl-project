@@ -1,5 +1,5 @@
 {
-  "algo": "mappo",
+  "algo": "dqn",
   "env_name": "simple_world_comm_v3",
   "num_good": 2,
   "num_adversaries": 4,
@@ -24,8 +24,10 @@
   "coop_radius": 0.5,
   "coop_bonus_per_extra": 2.0,
   "coverage_bonus": 3.0,
+  "frozen_good_path": "outputs/models/standard_good_mappo_full_coop_s42/final",
+  "frozen_good_deterministic": false,
   "train_team": "all",
-  "total_episodes": 200,
+  "total_episodes": 500,
   "update_every_n_episodes": 8,
   "eval_every_n_episodes": 100,
   "eval_episodes": 10,
@@ -53,5 +55,5 @@
   "run_name": "sanity",
   "device": "cpu",
   "seed": 42,
-  "exp_name": "sanity_mappo_full_coop_s42"
+  "exp_name": "sanity_dqn_full_coop_fg_s42"
 }
