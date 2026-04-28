@@ -28,9 +28,7 @@ class Config:
     num_adversaries: int = 4        # includes leader (1 leader + 3 normal)
     num_obstacles: int = 1
     num_food: int = 2
-    num_forests: int = 2           # 2 = only 26% occlusion (too weak)
-                                   # 4 = 69% occlusion (sweet spot)
-                                   # 6+ = occlusion drops again (forests overlap)
+    num_forests: int = 2           # per professor: keep default 2
     max_cycles: int = 50            # 25 too short; 100 inflates variance
     continuous_actions: bool = False
     dynamic_rescaling: bool = False
@@ -76,6 +74,16 @@ class Config:
                                      # 0.5 is ~25% of field; trainable policies trigger
     coop_bonus_per_extra: float = 2.0  # per extra teammate around a good, per step
     coverage_bonus: float = 3.0       # when ALL goods have an adv nearby, per step
+
+    # ──────────────────────────────────────────────
+    # Frozen good policy (for fair cross-algorithm comparison)
+    # ──────────────────────────────────────────────
+    # When set, the good agents use a pre-trained, frozen policy loaded from
+    # this checkpoint path, rather than learning alongside the adversaries.
+    # This is used in Phase 2+3 so that all adversary-side algorithms
+    # (MAPPO variants, DQN, DDPG, PSO) face an identical opponent.
+    frozen_good_path: Optional[str] = None
+    frozen_good_deterministic: bool = False  # True = argmax, False = sample
 
     # ──────────────────────────────────────────────
     # Training schedule
@@ -153,6 +161,8 @@ class Config:
         tag = f"{self.algo}_{self.ablation_mode}"
         if self.use_coop_reward:
             tag += "_coop"
+        if self.frozen_good_path:
+            tag += "_fg"  # frozen good
         if self.num_good != 2:
             tag += f"_g{self.num_good}"
         return f"{self.run_name}_{tag}_s{self.seed}"

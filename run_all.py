@@ -25,6 +25,15 @@ def parse_args():
                    help="Override total_episodes (default: use config.py value)")
     p.add_argument("--run_name", type=str, default="swc_f4",
                    help="Experiment run name prefix")
+    p.add_argument("--coop_reward", action="store_true",
+                   help="Enable cooperative reward shaping for all runs")
+    p.add_argument("--num_good", type=int, default=None,
+                   help="Override num_good for all runs (2 or 3)")
+    p.add_argument("--algo", type=str, default="mappo",
+                   choices=["mappo", "dqn", "ddpg", "pso"],
+                   help="Algorithm to run")
+    p.add_argument("--frozen_good", type=str, default=None,
+                   help="Path to MAPPO checkpoint dir (frozen good policy)")
     p.add_argument("--dry_run", action="store_true",
                    help="Print commands without executing")
     return p.parse_args()
@@ -45,11 +54,18 @@ def main():
     for seed in args.seeds:
         for ablation in args.ablations:
             cmd = [sys.executable, "main.py",
+                   "--algo", args.algo,
                    "--ablation", ablation,
                    "--seed", str(seed),
                    "--run_name", args.run_name]
             if args.episodes is not None:
                 cmd.extend(["--total_episodes", str(args.episodes)])
+            if args.coop_reward:
+                cmd.append("--coop_reward")
+            if args.num_good is not None:
+                cmd.extend(["--num_good", str(args.num_good)])
+            if args.frozen_good is not None:
+                cmd.extend(["--frozen_good", args.frozen_good])
             runs.append((ablation, seed, cmd))
 
     total = len(runs)
