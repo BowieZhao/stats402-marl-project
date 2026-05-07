@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PyCharm
+.idea/
+
+# Outputs 
+outputs/models/
+outputs/logs/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 大文件
+*.npz
